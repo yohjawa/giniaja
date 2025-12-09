@@ -1,25 +1,65 @@
-Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue
+param(
+    [string]$SiteURL,
+    [string]$LibraryName,
+    [string]$ConditionListName, 
+    [string]$DownloadPath,
+    [string]$LogFilePath,
+    [ValidateSet("All", "Public", "Restricted","Secret")]
+    [string]$DocumentClassification,
+    [ValidateSet("CreateDate", "DisposeDate")]
+    [string]$FilterCondition,
+    [datetime]$FilteredDate,
+    [switch]$DryRun,
+    [switch]$DeleteAfterDownload,
+    [switch]$Help,
+    [switch]$ListFields
+)
 
-# Configuration parameters
-$SiteURL = "http://mysharepointsite.com"
-$LibraryName = "E-ARCHIVES"
-$DownloadPath = "D:\temp\DL"
-$ClassificationCriteria = "Public" # Change this to your desired classification
+if (-not $SiteURL) {$SiteURL = "http://phmsp-earchiving.pertamina.com"}
+if (-not $LibraryName) {$LibraryName = "E-ARCHIVES"}
+if (-not $ConditionListName) {$ConditionListName = "VBOX"}
+if (-not $DownloadPath) {$DownloadPath = "D:\temp\DL"}
+if (-not $LogFilePath) {$LogFilePath = "D:\temp\Logs\SharePointDownloadLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"}
+if (-not $DocumentClassification) {$DocumentClassification = "Public"}
+if (-not $FilterCondition) {$FilterCondition = "DisposeDate"}
+if (-not $FilteredDate) {$FilteredDate = "2021-01-01"}
 
-# Choose ONE of the following date criteria options:
-# Option 1: Specific cutoff date
-$DisposedDateBefore = "2025-01-01" # Format: YYYY-MM-DD
+# Display help if requested
+if ($Help) {
+    Write-Host @"
+SharePoint Document Download Script
 
-# Option 2: Older than X years (alternative to specific date)
-# $DisposedDateOlderThanYears = 1 # Uncomment and use this if you prefer age-based criteria
+This script downloads documents from a SharePoint document library based on conditions from another SharePoint list.
 
-$DeleteAfterDownload = $false # Set to $false if you don't want to delete after download
-$DryRun = $true # Set to $false to actually perform download and delete operations
+Parameters:
+  -SiteURL <url>                 : SharePoint site URL (default: http://phmsp-earchiving.pertamina.com)
+  -LibraryName <name>            : Document library name (default: E-ARCHIVSE)
+  -ConditionListName <name>      : List name for filtering conditions (required)
+  -DownloadPath <path>           : Local path to download files (default: D:\temp\archives)
+  -LogFilePath <path>            : Path for log file (default: D:\temp\SharePointDownloadLog_<timestamp>.log)
+  -DocumentClassification <text> : Document classification to filter by (default: Public)
+  -FilterCondition <text>        : Filter document to download by either DisposeDate or Created column (default : DisposeDate)
+  -FilteredDate <date>           : Dispose date or Created date threshold (default: 2021-01-01)
+  -DryRun                        : Preview actions without executing
+  -DeleteAfterDownload           : Delete folders after successful download
+  -ListFields                    : List available fields in the condition list (for troubleshooting)
+  -Help                          : Show this help message
 
-# Logging configuration
-$LogPath = "D:\temp\Logs"
-$LogFileName = "SharePointDownload_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-$LogFile = Join-Path $LogPath $LogFileName
+Examples:
+  .\Script.ps1 -ConditionListName "DocumentMetadata" -DryRun
+  .\Script.ps1 -ConditionListName "DocumentMetadata" -ListFields
+  .\Script.ps1 -ConditionListName "DocumentMetadata" -DocumentClassification "Restricted" -DisposeDate "2024-06-30" -DeleteAfterDownload
+
+"@
+    exit
+}
+
+# Check if required parameter is provided
+if (-not $ConditionListName) {
+    Write-Host "Error: ConditionListName parameter is required. Use -Help for usage information." -ForegroundColor Red
+    exit 1
+}
+
 
 # Function to write log messages
 Function Write-Log {
@@ -32,304 +72,505 @@ Function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "$timestamp [$Level] $Message"
     
-    # Write to console with color
+    # Write to console
     Write-Host -ForegroundColor $Color $logEntry
     
     # Write to log file
-    try {
-        if (!(Test-Path $LogPath)) {
-            New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
-        }
-        Add-Content -Path $LogFile -Value $logEntry -ErrorAction Stop
-    }
-    catch {
-        Write-Host -ForegroundColor Red "Failed to write to log file: $($_.Exception.Message)"
-    }
+    Add-Content -Path $LogFilePath -Value $logEntry
 }
 
-# Function to get the cutoff date based on configuration
-Function Get-CutoffDate {
-    if ($DisposedDateBefore) {
-        try {
-            $cutoffDate = [DateTime]::Parse($DisposedDateBefore)
-            Write-Log -Message "Using specific cutoff date: $($cutoffDate.ToString('yyyy-MM-dd'))" -Level "INFO" -Color "Cyan"
-            return $cutoffDate
-        }
-        catch {
-            Write-Log -Message "Error parsing DisposedDateBefore '$DisposedDateBefore'. Please use YYYY-MM-DD format." -Level "ERROR" -Color "Red"
-            throw
-        }
-    }
-    elseif ($DisposedDateOlderThanYears) {
-        $cutoffDate = (Get-Date).AddYears(-$DisposedDateOlderThanYears)
-        Write-Log -Message "Using age-based cutoff date: $($cutoffDate.ToString('yyyy-MM-dd')) (older than $DisposedDateOlderThanYears year(s))" -Level "INFO" -Color "Cyan"
-        return $cutoffDate
-    }
-    else {
-        Write-Log -Message "No date criteria specified. Please set either DisposedDateBefore or DisposedDateOlderThanYears." -Level "ERROR" -Color "Red"
-        throw "Date criteria required"
-    }
-}
-
-# Function to check if folder meets criteria
-Function Test-SPFolderCriteria($Folder, $CutoffDate)
-{
-    $meetsCriteria = $true
-    
-    try {
-        # Try to get the folder as a list item to access custom fields
-        $folderItem = $Folder.Item
-        
-        if ($folderItem -ne $null) {
-            # Check classification criteria if specified
-            if ($ClassificationCriteria) {
-                $classificationValue = $folderItem["Data Classification"]
-                if ($classificationValue -ne $ClassificationCriteria) {
-                    return @{
-                        MeetsCriteria = $false
-                        Reason = "Classification mismatch: '$classificationValue' != '$ClassificationCriteria'"
-                    }
-                }
-            }
-            
-            # Check disposal date criteria
-            $disposedDate = $folderItem["Dispose Date"]
-            if ($disposedDate -ne $null) {
-                if ($disposedDate -ge $CutoffDate) {
-                    return @{
-                        MeetsCriteria = $false
-                        Reason = "Dispose Date too recent: $($disposedDate.ToString('yyyy-MM-dd')) >= $($CutoffDate.ToString('yyyy-MM-dd'))"
-                    }
-                }
-            }
-            else {
-                return @{
-                    MeetsCriteria = $false
-                    Reason = "No DisposedDate value"
-                }
-            }
-        }
-        else {
-            return @{
-                MeetsCriteria = $false
-                Reason = "Not a list item (no custom fields)"
-            }
-        }
-    }
-    catch {
-        return @{
-            MeetsCriteria = $false
-            Reason = "Error checking criteria: $($_.Exception.Message)"
-        }
-    }
-    
-    return @{
-        MeetsCriteria = $true
-        Reason = "Meets all criteria"
-    }
-}
-
-# Function to process folders for dry run (just reporting)
-Function Process-FoldersDryRun($SPFolder, $CutoffDate, $IndentLevel = 0)
-{
+# Function to list all fields in a SharePoint list
+Function Get-ListFields($SiteURL, $ListName) {
     Try {
-        $indent = "  " * $IndentLevel
-        $folderResult = Test-SPFolderCriteria -Folder $SPFolder -CutoffDate $CutoffDate
+        Write-Log "Listing fields for list: $ListName" -Color "Cyan"
         
-        if ($folderResult.MeetsCriteria) {
-            $logMessage = "$indent✓ FOLDER: $($SPFolder.ServerRelativeURL)"
-            Write-Log -Message $logMessage -Level "SUCCESS" -Color "Green"
-            Write-Log -Message "$indent  Reason: $($folderResult.Reason)" -Level "INFO" -Color "Gray"
-            
-            # Count files in this folder
-            $fileCount = $SPFolder.Files.Count
-            Write-Log -Message "$indent  Files: $fileCount file(s) would be downloaded" -Level "INFO" -Color "Cyan"
-            
-            if ($DeleteAfterDownload) {
-                Write-Log -Message "$indent  Action: Would download and DELETE $fileCount file(s)" -Level "WARNING" -Color "Yellow"
-            }
-            else {
-                Write-Log -Message "$indent  Action: Would download $fileCount file(s) (no deletion)" -Level "INFO" -Color "Cyan"
-            }
-        }
-        else {
-            $logMessage = "$indent✗ FOLDER: $($SPFolder.ServerRelativeURL)"
-            Write-Log -Message $logMessage -Level "SKIPPED" -Color "Red"
-            Write-Log -Message "$indent  Reason: $($folderResult.Reason)" -Level "INFO" -Color "Gray"
-            Write-Log -Message "$indent  Action: Skipped (no files would be processed)" -Level "INFO" -Color "DarkGray"
-        }
-        
-        Write-Log -Message "" -Level "INFO" -Color "White" # Empty line for readability
-  
-        # Process the Sub Folders recursively
-        ForEach ($SubFolder in $SPFolder.SubFolders)
-        {
-            If($SubFolder.Name -ne "Forms") # Leave "Forms" Folder
-            {
-                Process-FoldersDryRun -SPFolder $SubFolder -CutoffDate $CutoffDate -IndentLevel ($IndentLevel + 1)
-            }
-        }
-    }
-    Catch {
-        Write-Log -Message "$indentError processing folder: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
-    } 
-}
-
-# Function to Download Files from a SharePoint Folder (actual operations)
-Function Download-SPFolder($SPFolder, $DownloadPath, $CutoffDate)
-{
-    Try {
-        $DownloadPath = Join-Path $DownloadPath $SPFolder.Name
-        
-        # Ensure the destination local folder exists
-        If (!(Test-Path -path $DownloadPath)) {   
-            $LocalFolder = New-Item $DownloadPath -type directory -Force
-            Write-Log -Message "Created local folder: $DownloadPath" -Level "INFO" -Color "Cyan"
-        }
-  
-        # Loop through each file in the folder
-        ForEach ($File in $SPFolder.Files)
-        {
-            # Download the file without checking file-level criteria
-            try {
-                if (-not $DryRun) {
-                    $Data = $File.OpenBinary()
-                    $FilePath = Join-Path $DownloadPath $File.Name
-                    [System.IO.File]::WriteAllBytes($FilePath, $data)
-                    Write-Log -Message "Downloaded the File: $($File.ServerRelativeURL)" -Level "SUCCESS" -Color "Green"
-                    
-                    # Delete the file after successful download if enabled
-                    if ($DeleteAfterDownload) {
-                        try {
-                            $File.Delete()
-                            Write-Log -Message "Deleted the File: $($File.ServerRelativeURL)" -Level "WARNING" -Color "Yellow"
-                        }
-                        catch {
-                            Write-Log -Message "Error deleting file: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
-                        }
-                    }
-                }
-            }
-            catch {
-                Write-Log -Message "Error downloading file: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
-            }
-        }
-  
-        # Process the Sub Folders recursively with criteria checking
-        ForEach ($SubFolder in $SPFolder.SubFolders)
-        {
-            If($SubFolder.Name -ne "Forms") # Leave "Forms" Folder
-            {
-                # Check if the folder meets criteria
-                $folderResult = Test-SPFolderCriteria -Folder $SubFolder -CutoffDate $CutoffDate
-                if ($folderResult.MeetsCriteria) {
-                    Write-Log -Message "Processing qualified folder: $($SubFolder.ServerRelativeURL)" -Level "INFO" -Color "Magenta"
-                    # Call the function recursively
-                    Download-SPFolder -SPFolder $SubFolder -DownloadPath $DownloadPath -CutoffDate $CutoffDate
-                }
-                else {
-                    Write-Log -Message "Skipping folder (doesn't meet criteria): $($SubFolder.ServerRelativeURL)" -Level "INFO" -Color "Gray"
-                }
-            }
-        }
-    }
-    Catch {
-        Write-Log -Message "Error processing folder: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
-    } 
-}
-
-# Main Function
-Function Download-SPDocumentLibrary($SiteURL, $LibraryName, $DownloadPath)
-{
-    Write-Log -Message "Starting SharePoint Document Library Download Process" -Level "INFO" -Color "Magenta"
-    Write-Log -Message "Log file: $LogFile" -Level "INFO" -Color "Cyan"
-    
-    Try {
-        # Get the cutoff date
-        $CutoffDate = Get-CutoffDate
-        
-        # Get the Web
         $Web = Get-SPWeb $SiteURL
- 
-        # Get the document Library
-        $Library = $Web.Lists[$LibraryName]
-        Write-Log -Message "Processing Document Library: $($Library.Title)" -Level "INFO" -Color "Magenta"
-        Write-Log -Message "Criteria: Classification='$ClassificationCriteria', DisposedDate before $($CutoffDate.ToString('yyyy-MM-dd'))" -Level "INFO" -Color "Cyan"
-        Write-Log -Message "Dry Run: $DryRun" -Level "INFO" -Color "Yellow"
-        Write-Log -Message "Delete After Download: $DeleteAfterDownload" -Level "INFO" -Color "Yellow"
-        Write-Log -Message "=" * 80 -Level "INFO" -Color "White"
+        $List = $Web.Lists[$ListName]
         
-        if ($DryRun) {
-            Write-Log -Message "DRY RUN MODE - No files will be downloaded or deleted" -Level "WARNING" -Color "Yellow"
-            Write-Log -Message "Legend: ✓ = Meets criteria, ✗ = Doesn't meet criteria" -Level "INFO" -Color "Yellow"
-            Write-Log -Message "=" * 80 -Level "INFO" -Color "White"
-            
-            # Process root folder for dry run
-            Process-FoldersDryRun -SPFolder $Library.RootFolder -CutoffDate $CutoffDate
-            
-            Write-Log -Message "=" * 80 -Level "INFO" -Color "White"
-            Write-Log -Message "Dry run completed. Review the results above." -Level "SUCCESS" -Color "Green"
-            Write-Log -Message "Set `$DryRun = `$false to perform actual operations." -Level "INFO" -Color "Yellow"
-        }
-        else {
-            # Delete any existing files and folders in the download location
-            If (Test-Path $DownloadPath) {
-                Remove-Item -Path $DownloadPath -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Log -Message "Cleaned existing download directory: $DownloadPath" -Level "INFO" -Color "Cyan"
-            }
-            New-Item -Path $DownloadPath -ItemType Directory -Force | Out-Null
-            Write-Log -Message "Created download directory: $DownloadPath" -Level "INFO" -Color "Cyan"
-            
-            # Check if root folder meets criteria
-            $rootFolderResult = Test-SPFolderCriteria -Folder $Library.RootFolder -CutoffDate $CutoffDate
-            
-            if ($rootFolderResult.MeetsCriteria) {
-                Write-Log -Message "Root folder meets criteria, processing all content..." -Level "SUCCESS" -Color "Green"
-                Download-SPFolder -SPFolder $Library.RootFolder -DownloadPath $DownloadPath -CutoffDate $CutoffDate
-            }
-            else {
-                Write-Log -Message "Root folder doesn't meet criteria, processing subfolders only..." -Level "INFO" -Color "Magenta"
-                # Process only subfolders that meet criteria
-                ForEach ($SubFolder in $Library.RootFolder.SubFolders)
-                {
-                    If($SubFolder.Name -ne "Forms") # Leave "Forms" Folder
-                    {
-                        $folderResult = Test-SPFolderCriteria -Folder $SubFolder -CutoffDate $CutoffDate
-                        if ($folderResult.MeetsCriteria) {
-                            Write-Log -Message "Processing qualified folder: $($SubFolder.ServerRelativeURL)" -Level "INFO" -Color "Magenta"
-                            Download-SPFolder -SPFolder $SubFolder -DownloadPath $DownloadPath -CutoffDate $CutoffDate
-                        }
-                        else {
-                            Write-Log -Message "Skipping folder (doesn't meet criteria): $($SubFolder.ServerRelativeURL)" -Level "INFO" -Color "Gray"
-                        }
-                    }
-                }
-            }
- 
-            Write-Log -Message "*** Download Completed ***" -Level "SUCCESS" -Color "Green"
-            
-            # Show summary
-            if ($DeleteAfterDownload) {
-                Write-Log -Message "*** Files have been deleted from SharePoint after successful download ***" -Level "WARNING" -Color "Yellow"
-            }
-            else {
-                Write-Log -Message "*** Files remain in SharePoint (delete after download is disabled) ***" -Level "INFO" -Color "Yellow"
+        Write-Log "Available fields in list '$ListName':" -Color "Green"
+        Write-Log "======================================" -Color "Green"
+        
+        foreach ($field in $List.Fields) {
+            if (-not $field.Hidden) {
+                Write-Log "Field: '$($field.Title)' (InternalName: '$($field.InternalName)', Type: '$($field.TypeAsString)')" -Color "Yellow"
             }
         }
+        
+        return $true
     }
     Catch {
-        Write-Log -Message "Error Processing Document Library: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+        Write-Log "Error listing fields: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+        return $false
     }
     Finally {
         if ($Web -ne $null) {
             $Web.Dispose()
-            Write-Log -Message "Disposed SharePoint web object" -Level "INFO" -Color "Gray"
         }
-        Write-Log -Message "Process completed. Log saved to: $LogFile" -Level "INFO" -Color "Cyan"
     }
 }
 
-# Execute the main function
-Write-Log -Message "Script execution started" -Level "INFO" -Color "White"
-Download-SPDocumentLibrary $SiteURL $LibraryName $DownloadPath
-Write-Log -Message "Script execution finished" -Level "INFO" -Color "White"
+# Function to get items from SharePoint list that match criteria
+Function Get-FilteredListItems($SiteURL, $ListName, $DocumentClassification, $FilterCondition, $FilteredDate)
+{
+    Try {
+        Write-Log "Retrieving filtered items from list: $ListName" -Color "Cyan"
+        Write-Log "Filter criteria: Classification='$DocumentClassification', With $FilterCondition < '$($FilteredDate.ToString("yyyy-MM-dd"))'" -Color "Cyan"
+        
+        $Web = Get-SPWeb $SiteURL
+        $List = $Web.Lists[$ListName]
+
+         # First, try to get the field internal names
+        $classificationField = $null
+        $filteredDateField = $null
+
+        foreach ($field in $List.Fields) {
+            if ($field.Title -eq "IT Classification" -or $field.InternalName -eq "IT Classification") {
+                $classificationField = $field
+            }
+            if($FilterCondition -eq "DisposeDate") {
+                if ($field.Title -eq "Dispose Date" -or $field.InternalName -eq "Dispose Date") {
+                    $filteredDateField = $field
+                }
+            }
+            if($FilterCondition -eq "CreateDate") {
+                if ($field.Title -eq "Created" -or $field.InternalName -eq "Created") {
+                    $filteredDateField = $field
+                }
+            }
+        }
+        
+        if (-not $classificationField -or -not $filteredDateField) {
+            Write-Log "Required fields not found. Available fields:" -Level "WARNING" -Color "Yellow"
+            foreach ($field in $List.Fields) {
+                if (-not $field.Hidden) {
+                    Write-Log "  - $($field.Title) ($($field.InternalName), $($field.TypeAsString))" -Color "Yellow"
+                }
+            }
+            throw "Required fields (IT Classification and/or Dispose Date) not found in the list. Use -ListFields parameter to see available fields."
+        }
+        
+        # Format date for CAML query
+        $FilteredDateString = $FilteredDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        
+
+        # Create query to filter items
+        $Query = New-Object Microsoft.SharePoint.SPQuery
+        if ($DocumentClassification -eq "All") {
+            $Query.Query = "<Where>
+                            <Lt>
+                              <FieldRef Name='$($filteredDateField.InternalName)'/>
+                              <Value Type='$($filteredDateField.TypeAsString)'>$FilteredDateString</Value>
+                            </Lt>
+                        </Where>"
+        } else {
+            $Query.Query = "<Where>
+                          <And>
+                            <Eq>
+                              <FieldRef Name='$($classificationField.InternalName)'/>
+                              <Value Type='$($classificationField.TypeAsString)'>$DocumentClassification</Value>
+                            </Eq>
+                            <Lt>
+                              <FieldRef Name='$($filteredDateField.InternalName)'/>
+                              <Value Type='$($filteredDateField.TypeAsString)'>$FilteredDateString</Value>
+                            </Lt>
+                          </And>
+                        </Where>"
+        }
+        
+        Write-Log "Executing CAML query: $($Query.Query)" -Color "Gray"
+
+        $ListItems = $List.GetItems($Query)
+        Write-Log "Found $($ListItems.Count) items matching criteria" -Color "Green"
+        return $ListItems
+    }
+    Catch {
+        Write-Log "Error retrieving list items: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+
+        # Alternative approach: manually filter items if CAML query fails
+        Write-Log "Trying alternative filtering method..." -Color "Yellow"
+        try {
+            $allItems = $List.Items
+            $filteredItems = @()
+            
+            foreach ($item in $allItems) {
+                $itemClassification = $item[$classificationField.InternalName]
+                $itemFilteredDate = $item[$filteredDateField.InternalName]
+                
+                if ($itemClassification -eq $DocumentClassification -and $itemFilteredDate -ne $null -and $itemFilteredDate -lt $FilteredDate) {
+                    $filteredItems += $item
+                }
+            }
+            
+            Write-Log "Found $($filteredItems.Count) items using alternative filtering" -Color "Green"
+            return $filteredItems
+        }
+        catch {
+            Write-Log "Alternative filtering also failed: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+            return $null
+        }
+    }
+    Finally {
+        if ($Web -ne $null) {
+            $Web.Dispose()
+        }
+    }
+}
+
+# Function to create the structured folder path
+Function Get-StructuredFolderPath($Item, $DownloadPath, $FilterCondition) {
+    try {
+        # Get Account Division
+        $accountDivision = $Item["Account_x0020_Division"]
+        if ([string]::IsNullOrEmpty($accountDivision)) {
+            $accountDivision = "UnknownDivision"
+        }
+
+        # Get year from either CreatedDate or DisposeDate based on FilterCondition
+        $dateField = if ($FilterCondition -eq "CreateDate") { $Item["Created"] } else { $Item["Dispose_x0020_Date"] }
+        $year = "UnknownYear"
+        
+        if ($dateField -ne $null) {
+            try {
+                if ($dateField -is [string]) {
+                    $parsedDate = [datetime]::Parse($dateField)
+                    $year = $parsedDate.Year.ToString()
+                } else {
+                    $year = $dateField.Year.ToString()
+                }
+            }
+            catch {
+                Write-Log "Could not parse date field '$dateField', using 'UnknownYear'" -Level "WARNING" -Color "Yellow"
+            }
+        }
+
+        # Get VBOX name (from Title field)
+        $vboxName = $Item.Title
+        if ([string]::IsNullOrEmpty($vboxName)) {
+            $vboxName = "UnknownVBOX"
+        } else {
+            # Remove .xml extension if present
+            if ($vboxName -like "*.xml") {
+                $vboxName = [System.IO.Path]::GetFileNameWithoutExtension($vboxName)
+            }
+        }
+
+        # Create the full folder path
+        $fullPath = Join-Path $DownloadPath $accountDivision
+        $fullPath = Join-Path $fullPath $year
+        $fullPath = Join-Path $fullPath $vboxName
+
+        return $fullPath
+    }
+    catch {
+        Write-Log "Error creating structured folder path: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+        # Fallback to original folder name in DownloadPath
+        $folderName = $Item.Title
+        if ($folderName -like "*.xml") {
+            $folderName = [System.IO.Path]::GetFileNameWithoutExtension($folderName)
+        }
+        return Join-Path $DownloadPath $folderName
+    }
+}
+
+# Function to Download Specific Folder from SharePoint
+Function Download-SPFolder($SPFolderURL, $LocalFolderPath, $DryRun)
+{
+    Try {
+        # Get the Source SharePoint Folder
+        $SPFolder = $web.GetFolder($SPFolderURL)
+        
+        if (-not $DryRun) {
+            # Ensure the destination local folder exists!
+            If (!(Test-Path -path $LocalFolderPath)) {   
+                $LocalFolder = New-Item $LocalFolderPath -type directory -Force
+                Write-Log "Created local directory: $LocalFolderPath" -Color "Yellow"
+            }
+    
+            # Loop through each file in the folder and download it to Destination
+            $fileCount = 0
+            ForEach ($File in $SPFolder.Files)
+            {
+                # Download the file
+                $Data = $File.OpenBinary()
+                $FilePath = Join-Path $LocalFolderPath $File.Name
+                [System.IO.File]::WriteAllBytes($FilePath, $data)
+                $fileCount++
+                Write-Log "Downloaded file: $($File.Name) to $LocalFolderPath" -Color "Green"
+            }
+    
+            Write-Log "Downloaded $fileCount files from folder: $($SPFolder.Name) to $LocalFolderPath" -Color "Green"
+    
+            # Process the Sub Folders & Recursively call the function
+            $subFolderCount = 0
+            ForEach ($SubFolder in $SPFolder.SubFolders)
+            {
+                If($SubFolder.Name -ne "Forms") # Leave "Forms" Folder
+                {
+                    # Create corresponding local subfolder path - maintain the SharePoint folder structure
+                    $localSubFolderPath = Join-Path $LocalFolderPath $SubFolder.Name
+                    
+                    # Call the function Recursively
+                    Download-SPFolder $SubFolder $localSubFolderPath $DryRun
+                    $subFolderCount++
+                }
+            }
+            
+            if ($subFolderCount -gt 0) {
+                Write-Log "Processed $subFolderCount subfolders in: $($SPFolder.Name)" -Color "Green"
+            }
+        } else {
+            # Dry run - just count files and folders
+            $fileCount = $SPFolder.Files.Count
+            $subFolderCount = ($SPFolder.SubFolders | Where-Object {$_.Name -ne "Forms"}).Count
+            
+            Write-Log "DRY RUN: Would download $fileCount files from SharePoint folder '$($SPFolder.Name)' to local path '$LocalFolderPath'" -Color "Magenta"
+            if ($subFolderCount -gt 0) {
+                Write-Log "DRY RUN: Would process $subFolderCount subfolders in: $($SPFolder.Name)" -Color "Magenta"
+            }
+            
+            # Process subfolders recursively for dry run
+            ForEach ($SubFolder in $SPFolder.SubFolders)
+            {
+                If($SubFolder.Name -ne "Forms") {
+                    $localSubFolderPath = Join-Path $LocalFolderPath $SubFolder.Name
+                    Download-SPFolder $SubFolder $localSubFolderPath $DryRun
+                }
+            }
+        }
+        
+        return $true
+    }
+    Catch {
+        Write-Log "Error Downloading Folder $SPFolderURL to $LocalFolderPath : $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+        return $false
+    } 
+}
+
+# Function to delete SharePoint folder
+Function Remove-SPFolder($SPFolderURL, $DryRun)
+{
+    Try {
+        if (-not $DryRun) {
+            $folder = $web.GetFolder($SPFolderURL)
+            $folder.Delete()
+            Write-Log "Deleted folder: $SPFolderURL" -Color "Yellow"
+            return $true
+        } else {
+            Write-Log "DRY RUN: Would delete folder: $SPFolderURL" -Color "Magenta"
+            return $true
+        }
+    }
+    Catch {
+        Write-Log "Error deleting folder $SPFolderURL : $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+        return $false
+    }
+}
+
+# Main Function
+Function Download-SPDocumentLibraryByCondition($SiteURL, $LibraryName, $ConditionListName, $DownloadPath, $DryRun, $DeleteAfterDownload, $DocumentClassification, $FilterCondition, $FilteredDate)
+{
+    $successCount = 0
+    $failCount = 0
+    $deleteSuccessCount = 0
+    $deleteFailCount = 0
+    
+    $exportData = @()
+
+    Try {
+        Write-Log "Starting SharePoint Document Library Download Process" -Color "Cyan"
+        Write-Log "Site URL: $SiteURL" -Color "Cyan"
+        Write-Log "Library Name: $LibraryName" -Color "Cyan"
+        Write-Log "Condition List Name: $ConditionListName" -Color "Cyan"
+        Write-Log "Download Path: $DownloadPath" -Color "Cyan"
+        Write-Log "Document Classification: $DocumentClassification" -Color "Cyan"
+        Write-Log "Filter Condition : $FilterCondition" -Color "Cyan"
+        Write-Log "Filter Date Threshold: $($FilteredDate.ToString("yyyy-MM-dd"))" -Color "Cyan"
+        Write-Log "Dry Run: $DryRun" -Color "Cyan"
+        Write-Log "Delete After Download: $DeleteAfterDownload" -Color "Cyan"
+        Write-Log "Log File: $LogFilePath" -Color "Cyan"
+
+        # Get the web
+        $Web = Get-SPWeb $SiteURL
+        $global:web = $Web  # Make web available to other functions
+ 
+        # Get filtered items from the condition list
+        $FilteredItems = Get-FilteredListItems -SiteURL $SiteURL -ListName $ConditionListName -DocumentClassification $DocumentClassification -FilterCondition $FilterCondition -FilteredDate $FilteredDate
+        
+        if ($FilteredItems -eq $null -or $FilteredItems.Count -eq 0) {
+            Write-Log "No items found matching the criteria" -Color "Yellow"
+            return
+        }
+        
+        # Get the document library
+        $Library = $Web.Lists[$LibraryName]
+        Write-Log "Processing $($FilteredItems.Count) items matching criteria" -Color "Green"
+ 
+        # Process each filtered item
+        foreach ($Item in $FilteredItems) {
+            $FolderName = $Item.Title
+            Write-Log "Processing item: $FolderName" -Color "Cyan"
+            
+            # Remove .xml extension from the title to get the folder name (case-insensitive)
+            if ($FolderName -like "*.xml") {
+                $FolderName = [System.IO.Path]::GetFileNameWithoutExtension($FolderName)
+                Write-Log "Removed .xml extension, looking for folder: $FolderName" -Color "Yellow"
+            }
+
+            # Try to find the folder in the document library
+            try {
+                $Folder = $Library.RootFolder.SubFolders[$FolderName]
+                if ($Folder -ne $null) {
+                    Write-Log "Found matching folder: $FolderName" -Color "Green"
+                    
+                    # Create structured folder path - this creates the base path (AccountDivision/Year/VBOXNAME)
+                    $structuredBasePath = Get-StructuredFolderPath -Item $Item -DownloadPath $DownloadPath -FilterCondition $FilterCondition
+                    Write-Log "Structured base path: $structuredBasePath" -Color "Yellow"
+                    
+                    # Download the folder - this will maintain the SharePoint folder structure under the base path
+                    $downloadResult = Download-SPFolder -SPFolderURL $Folder.Url -LocalFolderPath $structuredBasePath -DryRun $DryRun
+                    
+                    if ($downloadResult) {
+                        $successCount++
+                        Write-Log "Successfully processed folder: $FolderName to $structuredBasePath" -Color "Green"
+
+                        # Add to export data
+                        $exportItem = [PSCustomObject]@{
+                            Name = $FolderName
+                            EPCode = $Item["EP_x0020_Code"]
+                            VBOXDescription = $Item["VBOX_x0020_Description"]
+                            ITClassification = $Item["IT_x0020_Classification"]
+                            AccountDepartment = $Item["Account_x0020_Department"]
+                            AccountDivision = $Item["Account_x0020_Division"]
+                            CreatedDate = $Item["Created"]
+                            DisposeDate = $Item["Dispose_x0020_Date"]
+                            DownloadedFolder = $structuredBasePath
+                            Status = "Success"
+                        }
+                        $exportData += $exportItem
+                        
+                        # Delete the folder if requested and download was successful
+                        if ($DeleteAfterDownload -and (-not $DryRun)) {
+                            $deleteResult = Remove-SPFolder -SPFolderURL $Folder.Url -DryRun $DryRun
+                            if ($deleteResult) {
+                                $deleteSuccessCount++
+                                Write-Log "Successfully deleted folder: $FolderName" -Color "Yellow"
+                                $exportItem.Status = "Success (Deleted)"
+                            } else {
+                                $deleteFailCount++
+                                Write-Log "Failed to delete folder: $FolderName" -Level "ERROR" -Color "Red"
+                                $exportItem.Status = "Success (Delete Failed)"
+                            }
+                        }
+                    } else {
+                        $failCount++
+                        Write-Log "Failed to process folder: $FolderName" -Level "ERROR" -Color "Red"
+
+                        # Add to export data with error status
+                        $exportItem = [PSCustomObject]@{
+                            Name = $FolderName
+                            EPCode = $Item["EP_x0020_Code"]
+                            VBOXDescription = $Item["VBOX_x0020_Description"]
+                            ITClassification = $Item["IT_x0020_Classification"]
+                            AccountDepartment = $Item["Account_x0020_Department"]
+                            AccountDivision = $Item["Account_x0020_Division"]
+                            CreatedDate = $Item["Created"]
+                            DisposeDate = $Item["Dispose_x0020_Date"]
+                            DownloadedFolder = $structuredBasePath
+                            Status = "Download Failed"
+                        }
+                        $exportData += $exportItem
+                    }
+                }
+                else {
+                    Write-Log "Folder not found in document library: $FolderName" -Color "Yellow"
+
+                    # Add to export data with not found status
+                    $exportItem = [PSCustomObject]@{
+                        Name = $FolderName
+                        EPCode = $Item["EP_x0020_Code"]
+                        VBOXDescription = $Item["VBOX_x0020_Description"]
+                        ITClassification = $Item["IT_x0020_Classification"]
+                        AccountDepartment = $Item["Account_x0020_Department"]
+                        AccountDivision = $Item["Account_x0020_Division"]
+                        CreatedDate = $Item["Created"]
+                        DisposeDate = $Item["Dispose_x0020_Date"]
+                        DownloadedFolder = ""
+                        Status = "Folder Not Found"
+                    }
+                    $exportData += $exportItem
+                }
+            }
+            catch {
+                Write-Log "Error accessing folder $FolderName : $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+                $failCount++
+
+                # Add to export data with error status
+                $exportItem = [PSCustomObject]@{
+                    Name = $FolderName
+                    EPCode = $Item["EP_x0020_Code"]
+                    VBOXDescription = $Item["VBOX_x0020_Description"]
+                    ITClassification = $Item["IT_x0020_Classification"]
+                    AccountDepartment = $Item["Account_x0020_Department"]
+                    AccountDivision = $Item["Account_x0020_Division"]
+                    CreatedDate = $Item["Created"]
+                    DisposeDate = $Item["Dispose_x0020_Date"]
+                    DownloadedFolder = ""
+                    Status = "Error: $($_.Exception.Message)"
+                }
+                $exportData += $exportItem
+            }
+        }
+
+        # Export to CSV file
+        if ($exportData.Count -gt 0) {
+            $csvFilePath = Join-Path (Split-Path $LogFilePath -Parent) "DownloadReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+            $exportData | Export-Csv -Path $csvFilePath -NoTypeInformation -Encoding UTF8
+            Write-Log "Export report saved to: $csvFilePath" -Color "Green"
+        }
+ 
+        # Summary report
+        Write-Log "=== PROCESS SUMMARY ===" -Color "Cyan"
+        Write-Log "Filter criteria: Classification='$DocumentClassification', With $FilterCondition < '$($FilteredDate.ToString("yyyy-MM-dd"))'" -Color "Cyan"
+        Write-Log "Total items processed: $($FilteredItems.Count)" -Color "Cyan"
+        Write-Log "Successfully downloaded: $successCount" -Color "Green"
+        Write-Log "Failed to download: $failCount" -Color "Red"
+        
+        if ($DeleteAfterDownload) {
+            Write-Log "Successfully deleted: $deleteSuccessCount" -Color "Green"
+            Write-Log "Failed to delete: $deleteFailCount" -Color "Red"
+        }
+        
+        if ($DryRun) {
+            Write-Log "*** DRY RUN COMPLETED - No changes were made ***" -Color "Magenta"
+        } else {
+            Write-Log "*** OPERATION COMPLETED ***" -Color "Green"
+        }
+    }
+    Catch {
+        Write-Log "Error in main process: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+    }
+    Finally {
+        if ($Web -ne $null) {
+            $Web.Dispose()
+            Remove-Variable web -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Main execution
+try {
+    # List fields if requested
+    if ($ListFields) {
+        Get-ListFields -SiteURL $SiteURL -ListName $ConditionListName
+        exit
+    }
+
+    # Execute the download process
+    Download-SPDocumentLibraryByCondition -SiteURL $SiteURL -LibraryName $LibraryName -ConditionListName $ConditionListName -DownloadPath $DownloadPath -DryRun $DryRun -DeleteAfterDownload $DeleteAfterDownload -DocumentClassification $DocumentClassification -FilterCondition $FilterCondition -FilteredDate $FilteredDate
+
+    Write-Log "Log file saved to: $LogFilePath" -Color "Cyan"
+}
+catch {
+    Write-Log "Unexpected error: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+    Write-Log "Stack trace: $($_.Exception.StackTrace)" -Level "ERROR" -Color "Red"
+}
